@@ -46,11 +46,34 @@ func (qfs QUICFrames) Build(cryptoData []byte) (payload []byte, err error) {
 				// calculate length: from offset to the end of cryptoData
 				length = len(cryptoData) - lengthOffset
 			}
+			
+			// Ensure bounds are valid
+			if lengthOffset < 0 {
+				lengthOffset = 0
+			}
+			if lengthOffset >= len(cryptoData) {
+				lengthOffset = len(cryptoData) - 1
+				if lengthOffset < 0 {
+					lengthOffset = 0
+				}
+			}
+			if length < 0 {
+				length = 0
+			}
+			if lengthOffset + length > len(cryptoData) {
+				length = len(cryptoData) - lengthOffset
+				if length < 0 {
+					length = 0
+				}
+			}
+			
 			frameBytes = []byte{0x06} // CRYPTO frame type
 			frameBytes = quicvarint.Append(frameBytes, uint64(offset))
 			frameBytes = quicvarint.Append(frameBytes, uint64(length))
 			frameCryptoData := make([]byte, length)
-			copy(frameCryptoData, cryptoData[lengthOffset:]) // copy at most length bytes
+			if length > 0 && lengthOffset < len(cryptoData) {
+				copy(frameCryptoData, cryptoData[lengthOffset:]) // copy at most length bytes
+			}
 			frameBytes = append(frameBytes, frameCryptoData...)
 		} else { // Handle none crypto frames: read and append to payload
 			frameBytes, err = frame.Read()
@@ -215,11 +238,33 @@ func (qrf *QUICRandomFrames) Build(cryptoData []byte) (payload []byte, err error
 	if qrf.MinPADDING > qrf.MaxPADDING && qrf.Length != 0 {
 		return nil, errors.New("MinPADDING must be less than or equal to MaxPADDING if Length is not 0")
 	}
+	
+	// Additional validation to prevent edge cases
+	if qrf.MaxPING < qrf.MinPING+1 {
+		return nil, errors.New("MaxPING must be at least MinPING+1 to allow random selection")
+	}
+	if qrf.MaxCRYPTO < qrf.MinCRYPTO+1 {
+		return nil, errors.New("MaxCRYPTO must be at least MinCRYPTO+1 to allow random selection")
+	}
+	if qrf.Length != 0 && qrf.MaxPADDING < qrf.MinPADDING+1 {
+		return nil, errors.New("MaxPADDING must be at least MinPADDING+1 to allow random selection")
+	}
 
 	var frameList QUICFrames = make([]QUICFrame, 0)
 
 	var cryptoSafeRandUint64 = func(min, max uint64) (uint64, error) {
-		minMaxDiff := big.NewInt(int64(max - min))
+		// Handle the case where max <= min (which causes rand.Int to panic)
+		if max <= min {
+			return min, nil
+		}
+		
+		// Use proper unsigned arithmetic to avoid overflow
+		diff := max - min
+		if diff == 0 {
+			return min, nil
+		}
+		
+		minMaxDiff := big.NewInt(0).SetUint64(diff)
 		offset, err := rand.Int(rand.Reader, minMaxDiff)
 		if err != nil {
 			return 0, err
@@ -250,13 +295,41 @@ func (qrf *QUICRandomFrames) Build(cryptoData []byte) (payload []byte, err error
 		// randomly select length of CRYPTO frame.
 		// Length must be at least 1 byte and at most the remaining length of cryptoData minus the remaining number of CRYPTO frames.
 		// i.e. len in [1, len(cryptoData)-offsetCryptoData-(numCRYPTO-i-2))
-		lenCRYPTO, err := cryptoSafeRandUint64(1, lenCryptoData-(numCRYPTO-i-2))
+		remainingFrames := numCRYPTO - i - 2
+		remainingData := lenCryptoData - offsetCryptoData
+		
+		var maxLen uint64
+		if remainingFrames >= remainingData {
+			// If we have more remaining frames than data, just use 1 byte
+			maxLen = 1
+		} else {
+			maxLen = remainingData - remainingFrames
+			// Ensure maxLen is at least 1 to prevent panic
+			if maxLen <= 1 {
+				maxLen = 1
+			}
+		}
+		
+		// Ensure we don't exceed the actual cryptoData bounds
+		if offsetCryptoData >= lenCryptoData {
+			maxLen = 1
+		}
+		
+		lenCRYPTO, err := cryptoSafeRandUint64(1, maxLen)
 		if err != nil {
 			return nil, err
 		}
+		
+		// Ensure the frame doesn't exceed the cryptoData bounds
+		if offsetCryptoData + lenCRYPTO > lenCryptoData {
+			lenCRYPTO = lenCryptoData - offsetCryptoData
+			if lenCRYPTO == 0 {
+				lenCRYPTO = 1
+			}
+		}
+		
 		frameList = append(frameList, QUICFrameCrypto{Offset: int(offsetCryptoData), Length: int(lenCRYPTO)})
 		offsetCryptoData += lenCRYPTO
-		lenCryptoData -= lenCRYPTO
 	}
 
 	// append the last CRYPTO frame
@@ -282,7 +355,19 @@ func (qrf *QUICRandomFrames) Build(cryptoData []byte) (payload []byte, err error
 			// randomly select length of PADDING frame.
 			// Length must be at least 1 byte and at most the remaining length of cryptoData minus the remaining number of CRYPTO frames.
 			// i.e. len in [1, lenPADDING-(numPADDING-i-2))
-			lenPADDINGFrame, err := cryptoSafeRandUint64(1, lenPADDING-(numPADDING-i-2))
+			remainingFrames := numPADDING - i - 2
+			var maxLen uint64
+			if remainingFrames >= lenPADDING {
+				// If we have more remaining frames than padding, just use 1 byte
+				maxLen = 1
+			} else {
+				maxLen = lenPADDING - remainingFrames
+				// Ensure maxLen is at least 1 to prevent panic
+				if maxLen <= 1 {
+					maxLen = 1
+				}
+			}
+			lenPADDINGFrame, err := cryptoSafeRandUint64(1, maxLen)
 			if err != nil {
 				return nil, err
 			}
@@ -290,8 +375,8 @@ func (qrf *QUICRandomFrames) Build(cryptoData []byte) (payload []byte, err error
 			lenPADDING -= lenPADDINGFrame
 		}
 
-		// append the last CRYPTO frame
-		frameList = append(frameList, QUICFramePadding{Length: int(lenPADDING)}) // 0 means the remaining
+		// append the last PADDING frame
+		frameList = append(frameList, QUICFramePadding{Length: int(lenPADDING)}) // remaining padding
 	}
 
 	// shuffle the frameList

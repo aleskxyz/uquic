@@ -675,6 +675,10 @@ func ShuffleQUICTransportParameters(qtp *tls.QUICTransportParametersExtension) *
 func VariableLengthGREASEQTP(maxLen int) *tls.GREASETransportParameter {
 	// get random length for GREASE
 	greaseMaxLen := big.NewInt(0x10)
+	// Ensure greaseMaxLen is at least 1 to prevent panic
+	if greaseMaxLen.Cmp(big.NewInt(1)) <= 0 {
+		greaseMaxLen = big.NewInt(1)
+	}
 	greaseLen, err := rand.Int(rand.Reader, greaseMaxLen)
 	if err != nil {
 		panic(err)
